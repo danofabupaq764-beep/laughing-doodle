@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
-Dexscreener Telegram Lead Bot – DM Only
-Fetches token addresses, gets pair data (Telegram + liquidity), and sends leads.
+Dexscreener Telegram Lead Bot – DM Only (diagnostic version)
 """
 
 import asyncio
+import json
 import logging
 import os
 import sys
@@ -30,7 +30,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ----------------------------------------------------------------------
-# Database helpers
+# Database helpers (unchanged)
 # ----------------------------------------------------------------------
 async def init_db():
     os.makedirs(os.path.dirname(DB_PATH) or ".", exist_ok=True)
@@ -128,7 +128,10 @@ async def fetch_token_addresses(session: aiohttp.ClientSession, url: str, label:
     return addresses
 
 def find_telegram(socials: list) -> str | None:
-    """Scan social objects for a Telegram URL."""
+    """
+    Robust Telegram detection. Checks type, label, and URL itself.
+    Logs a warning if a possible candidate is found but not matched.
+    """
     for s in socials:
         if not isinstance(s, dict):
             continue
@@ -137,22 +140,26 @@ def find_telegram(socials: list) -> str | None:
             continue
         stype = s.get("type", "").lower()
         slabel = s.get("label", "").lower()
-        if "telegram" in stype or "tg" in stype or \
-           "telegram" in slabel or "tg" in slabel:
+        # Known patterns
+        if "telegram" in stype or "tg" in stype:
             return url if url.startswith("http") else f"https://{url}"
-        if "t.me" in url:
+        if "telegram" in slabel or "tg" in slabel:
+            return url if url.startswith("http") else f"https://{url}"
+        # Check URL itself for common Telegram domains
+        if "t.me" in url or "telegram.me" in url or "telegram.org" in url:
+            return url if url.startswith("http") else f"https://{url}"
+        # Extra fallback: if URL contains "telegram" at all
+        if "telegram" in url.lower():
             return url if url.startswith("http") else f"https://{url}"
     return None
 
 async def fetch_pair_data(session: aiohttp.ClientSession, addresses: set[str]) -> list[dict]:
-    """
-    Batch‑fetch pairs for the given addresses.
-    Returns a list of lead dicts containing name, chain, tg, tw, web, liquidity.
-    """
+    """Batch‑fetch pairs and return leads with Telegram links."""
     leads = []
     base_url = "https://api.dexscreener.com/latest/dex/tokens/"
     addr_list = list(addresses)
     chunk_size = 30
+    sample_logged = False
 
     for i in range(0, len(addr_list), chunk_size):
         chunk = addr_list[i:i + chunk_size]
@@ -161,22 +168,32 @@ async def fetch_pair_data(session: aiohttp.ClientSession, addresses: set[str]) -
             async with session.get(url) as resp:
                 if resp.status == 200:
                     data = await resp.json()
-                    # FIX: pairs can be null, treat as [] if so
-                    pairs = data.get("pairs") or []
-                    for pair in pairs:
+                    pairs = data.get("pairs") or []   # handle null
+                    for idx, pair in enumerate(pairs):
                         base = pair.get("baseToken", {})
                         addr = base.get("address")
                         name = base.get("name", "?")
                         chain = pair.get("chainId", "?")
                         liquidity = pair.get("liquidity", {}).get("usd", 0)
-                        info = pair.get("info", {})
+                        info = pair.get("info") or {}
                         socials = info.get("socials", [])
+
+                        # Diagnostic: log first 3 pairs' socials
+                        if not sample_logged and idx < 3:
+                            logger.info(
+                                "Sample pair %d: name=%s socials=%s",
+                                idx + 1,
+                                name,
+                                json.dumps(socials),
+                            )
+                            if idx == 2:
+                                sample_logged = True
+
                         tg = find_telegram(socials)
                         if not tg:
                             continue
 
-                        twitter = None
-                        website = None
+                        twitter = website = None
                         for s in socials:
                             stype = s.get("type", "").lower()
                             surl = s.get("url", "")
@@ -197,7 +214,7 @@ async def fetch_pair_data(session: aiohttp.ClientSession, addresses: set[str]) -
                             "liquidity": liquidity,
                         })
                 else:
-                    logger.warning("Pair batch returned status %s for %s", resp.status, url[:80])
+                    logger.warning("Pair chunk status %s for %s", resp.status, url[:80])
         except Exception as e:
             logger.error("Pair batch error for %s: %s", url[:80], e)
     return leads
@@ -214,7 +231,6 @@ async def job_fetch_and_send(context: ContextTypes.DEFAULT_TYPE):
     logger.info("Fetch cycle started for %d user(s).", len(active_users))
 
     async with aiohttp.ClientSession() as session:
-        # 1. Collect token addresses from listing endpoints
         latest_addrs = await fetch_token_addresses(
             session, "https://api.dexscreener.com/token-profiles/latest/v1", "Latest"
         )
@@ -231,7 +247,6 @@ async def job_fetch_and_send(context: ContextTypes.DEFAULT_TYPE):
                 )
             return
 
-        # 2. Get leads with Telegram from pair data
         leads = await fetch_pair_data(session, all_addresses)
         logger.info("Leads with Telegram from pairs: %d", len(leads))
 
@@ -242,7 +257,6 @@ async def job_fetch_and_send(context: ContextTypes.DEFAULT_TYPE):
                 )
             return
 
-        # 3. Filter by min liquidity, deduplicate, and send
         sent_any = False
         for user_id, chat_id, min_liq in active_users:
             user_sent = 0
@@ -265,7 +279,7 @@ async def job_fetch_and_send(context: ContextTypes.DEFAULT_TYPE):
                     user_sent += 1
                     await mark_as_sent(lead["tg"])
                 except Exception as e:
-                    logger.error("Send failed user %s: %s", user_id, e)
+                    logger.error("Send failed for user %s: %s", user_id, e)
                     if "Forbidden" in str(e):
                         await set_active(user_id, False)
 
