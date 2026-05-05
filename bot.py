@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Dexscreener Telegram Lead Bot – DM Only
-Uses token profiles to grab addresses, then pair data for Telegram & liquidity.
+Fetches token addresses, gets pair data (Telegram + liquidity), and sends leads.
 """
 
 import asyncio
@@ -104,10 +104,9 @@ async def set_min_liquidity(user_id: int, value: float):
         await db.commit()
 
 # ----------------------------------------------------------------------
-# Dexscreener API – simple address collector
+# Dexscreener API helpers
 # ----------------------------------------------------------------------
 async def fetch_token_addresses(session: aiohttp.ClientSession, url: str, label: str) -> set[str]:
-    """Return a set of 'chainId:tokenAddress' strings from a profile endpoint."""
     addresses = set()
     try:
         async with session.get(url) as resp:
@@ -129,7 +128,7 @@ async def fetch_token_addresses(session: aiohttp.ClientSession, url: str, label:
     return addresses
 
 def find_telegram(socials: list) -> str | None:
-    """Search a list of social objects for a Telegram URL."""
+    """Scan social objects for a Telegram URL."""
     for s in socials:
         if not isinstance(s, dict):
             continue
@@ -145,12 +144,10 @@ def find_telegram(socials: list) -> str | None:
             return url if url.startswith("http") else f"https://{url}"
     return None
 
-async def fetch_pair_data(
-    session: aiohttp.ClientSession, addresses: set[str]
-) -> list[dict]:
+async def fetch_pair_data(session: aiohttp.ClientSession, addresses: set[str]) -> list[dict]:
     """
     Batch‑fetch pairs for the given addresses.
-    Returns a list of lead dicts with name, chain, tg, tw, web, liquidity.
+    Returns a list of lead dicts containing name, chain, tg, tw, web, liquidity.
     """
     leads = []
     base_url = "https://api.dexscreener.com/latest/dex/tokens/"
@@ -164,7 +161,9 @@ async def fetch_pair_data(
             async with session.get(url) as resp:
                 if resp.status == 200:
                     data = await resp.json()
-                    for pair in data.get("pairs", []):
+                    # FIX: pairs can be null, treat as [] if so
+                    pairs = data.get("pairs") or []
+                    for pair in pairs:
                         base = pair.get("baseToken", {})
                         addr = base.get("address")
                         name = base.get("name", "?")
@@ -174,19 +173,19 @@ async def fetch_pair_data(
                         socials = info.get("socials", [])
                         tg = find_telegram(socials)
                         if not tg:
-                            continue  # skip tokens without Telegram
+                            continue
 
                         twitter = None
                         website = None
                         for s in socials:
                             stype = s.get("type", "").lower()
-                            url_s = s.get("url", "")
-                            if not url_s:
+                            surl = s.get("url", "")
+                            if not surl:
                                 continue
                             if "twitter" in stype and not twitter:
-                                twitter = url_s
+                                twitter = surl
                             if "website" in stype and not website:
-                                website = url_s
+                                website = surl
 
                         leads.append({
                             "name": name,
@@ -197,8 +196,10 @@ async def fetch_pair_data(
                             "addr": addr,
                             "liquidity": liquidity,
                         })
+                else:
+                    logger.warning("Pair batch returned status %s for %s", resp.status, url[:80])
         except Exception as e:
-            logger.error("Pair batch error: %s", e)
+            logger.error("Pair batch error for %s: %s", url[:80], e)
     return leads
 
 # ----------------------------------------------------------------------
@@ -213,7 +214,7 @@ async def job_fetch_and_send(context: ContextTypes.DEFAULT_TYPE):
     logger.info("Fetch cycle started for %d user(s).", len(active_users))
 
     async with aiohttp.ClientSession() as session:
-        # 1. Collect all unique token addresses from two listing endpoints
+        # 1. Collect token addresses from listing endpoints
         latest_addrs = await fetch_token_addresses(
             session, "https://api.dexscreener.com/token-profiles/latest/v1", "Latest"
         )
@@ -230,7 +231,7 @@ async def job_fetch_and_send(context: ContextTypes.DEFAULT_TYPE):
                 )
             return
 
-        # 2. Fetch pair data -> leads with Telegram
+        # 2. Get leads with Telegram from pair data
         leads = await fetch_pair_data(session, all_addresses)
         logger.info("Leads with Telegram from pairs: %d", len(leads))
 
@@ -241,14 +242,13 @@ async def job_fetch_and_send(context: ContextTypes.DEFAULT_TYPE):
                 )
             return
 
-        # 3. Filter by user min_liquidity and send
+        # 3. Filter by min liquidity, deduplicate, and send
         sent_any = False
         for user_id, chat_id, min_liq in active_users:
             user_sent = 0
             for lead in leads:
                 if lead["liquidity"] < min_liq:
                     continue
-                # Skip duplicates (already sent in previous cycles)
                 if await is_duplicate(lead["tg"]):
                     continue
 
@@ -282,7 +282,7 @@ async def job_fetch_and_send(context: ContextTypes.DEFAULT_TYPE):
                 )
 
 # ----------------------------------------------------------------------
-# Command handlers (unchanged)
+# Command handlers
 # ----------------------------------------------------------------------
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
