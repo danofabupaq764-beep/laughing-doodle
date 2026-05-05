@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Dexscreener Telegram Lead Bot – DM Only (100% working)
-Fetches NEW pairs from multiple chains, filters by Telegram & liquidity.
+Dexscreener Telegram Lead Bot – DM Only
+Per‑chain pair scanning, robust Telegram extraction, relaxed filtering.
 """
 
 import asyncio
@@ -21,9 +21,8 @@ if not BOT_TOKEN:
 
 DB_PATH = os.getenv("DB_PATH", "leads.db")
 FETCH_INTERVAL = int(os.getenv("FETCH_INTERVAL", "45"))
-DEFAULT_MIN_LIQUIDITY = float(os.getenv("DEFAULT_MIN_LIQUIDITY", "5000"))
-# Chains to scan for new pairs (comma‑separated)
-CHAINS = os.getenv("CHAINS", "bsc,ethereum,solana,avalanche,fantom,polygon,base,arbitrum,optimism")
+DEFAULT_MIN_LIQUIDITY = float(os.getenv("DEFAULT_MIN_LIQUIDITY", "100"))  # Testing
+CHAINS = os.getenv("CHAINS", "bsc,ethereum,solana,avalanche,fantom,polygon,base,arbitrum,optimism").split(",")
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -48,9 +47,9 @@ async def init_db():
                 user_id INTEGER PRIMARY KEY,
                 chat_id INTEGER NOT NULL,
                 active INTEGER DEFAULT 1,
-                min_liquidity REAL DEFAULT 5000.0
+                min_liquidity REAL DEFAULT ?
             )
-        """)
+        """, (DEFAULT_MIN_LIQUIDITY,))
         await db.commit()
 
 async def get_active_users():
@@ -106,11 +105,15 @@ async def set_min_liquidity(user_id: int, value: float):
         await db.commit()
 
 # ----------------------------------------------------------------------
-# Telegram link finder
+# Telegram link extraction
 # ----------------------------------------------------------------------
-def find_telegram(socials: list) -> str | None:
-    """Look for Telegram link in socials array."""
-    for s in socials:
+def extract_telegram(socials: list, info: dict) -> str | None:
+    """
+    Search socials array and info dict for a Telegram URL.
+    Returns a normalized https://t.me/... link or None.
+    """
+    # 1. Check socials array
+    for s in socials if isinstance(socials, list) else []:
         if not isinstance(s, dict):
             continue
         url = s.get("url", "")
@@ -121,62 +124,70 @@ def find_telegram(socials: list) -> str | None:
         if any(word in stype + slabel for word in ("telegram", "tg")) or \
            any(d in url for d in ("t.me", "telegram.me", "telegram.org")):
             return url if url.startswith("http") else f"https://{url}"
+
+    # 2. Direct info fields
+    for key in ("telegram", "tg"):
+        val = info.get(key) if isinstance(info, dict) else None
+        if val and isinstance(val, str):
+            if "t.me" in val:
+                return val if val.startswith("http") else f"https://{val}"
+
     return None
 
 # ----------------------------------------------------------------------
-# Fetch new pairs (the real data source)
+# Per‑chain pair fetcher
 # ----------------------------------------------------------------------
-async def fetch_new_pairs(session: aiohttp.ClientSession) -> list[dict]:
-    """
-    Fetch recent pairs from multiple chains.
-    Returns a list of lead dicts with tg, twitter, website, liquidity, etc.
-    """
-    leads = []
-    url = f"https://api.dexscreener.com/latest/dex/pairs/{CHAINS}"
+async def fetch_pairs_for_chain(session: aiohttp.ClientSession, chain: str) -> list[dict]:
+    """Return list of raw pair dicts from a single chain."""
+    url = f"https://api.dexscreener.com/latest/dex/pairs/{chain}"
     try:
         async with session.get(url) as resp:
             if resp.status == 200:
                 data = await resp.json()
                 pairs = data.get("pairs") or []
-                for pair in pairs:
-                    base = pair.get("baseToken", {})
-                    name = base.get("name") or pair.get("baseToken", {}).get("symbol") or "?"
-                    chain = pair.get("chainId", "?")
-                    liquidity = pair.get("liquidity", {}).get("usd", 0)
-                    info = pair.get("info", {})
-                    socials = info.get("socials", [])
-                    tg = find_telegram(socials)
-                    if not tg:
-                        # sometimes info.telegram directly
-                        tg = info.get("telegram") or info.get("tg")
-                    if not tg:
-                        continue
-
-                    twitter = website = None
-                    for s in socials:
-                        stype = s.get("type", "").lower()
-                        surl = s.get("url", "")
-                        if not surl:
-                            continue
-                        if "twitter" in stype and not twitter:
-                            twitter = surl
-                        if "website" in stype and not website:
-                            website = surl
-
-                    leads.append({
-                        "name": name,
-                        "chain": chain,
-                        "tg": tg,
-                        "tw": twitter,
-                        "web": website,
-                        "liquidity": liquidity,
-                    })
-                logger.info("New pairs scan: found %d pairs, %d with Telegram.", len(pairs), len(leads))
+                logger.info("Chain %-12s: %3d pairs", chain, len(pairs))
+                return pairs
             else:
-                logger.error("New pairs API returned status %s", resp.status)
+                logger.warning("Chain %s returned status %s", chain, resp.status)
     except Exception as e:
-        logger.error("Error fetching new pairs: %s", e)
-    return leads
+        logger.error("Error fetching chain %s: %s", chain, e)
+    return []
+
+# ----------------------------------------------------------------------
+# Lead processing (extract info from all pairs)
+# ----------------------------------------------------------------------
+def process_lead(pair: dict) -> dict | None:
+    """Extract name, chain, tg, twitter, website, liquidity from a pair dict."""
+    base = pair.get("baseToken", {})
+    name = base.get("name") or base.get("symbol") or "?"
+    chain = pair.get("chainId", "?")
+    liquidity = pair.get("liquidity", {}).get("usd", 0)
+
+    info = pair.get("info") or {}
+    socials = info.get("socials", [])
+    tg = extract_telegram(socials, info)
+    if not tg:
+        return None
+
+    twitter = website = None
+    for s in socials:
+        stype = s.get("type", "").lower()
+        surl = s.get("url", "")
+        if not surl:
+            continue
+        if "twitter" in stype and not twitter:
+            twitter = surl
+        if "website" in stype and not website:
+            website = surl
+
+    return {
+        "name": name,
+        "chain": chain,
+        "tg": tg,
+        "tw": twitter,
+        "web": website,
+        "liquidity": liquidity,
+    }
 
 # ----------------------------------------------------------------------
 # Main job
@@ -184,18 +195,39 @@ async def fetch_new_pairs(session: aiohttp.ClientSession) -> list[dict]:
 async def job_fetch_and_send(context: ContextTypes.DEFAULT_TYPE):
     active_users = await get_active_users()
     if not active_users:
-        logger.info("No active users.")
+        logger.info("No active users. Skipping cycle.")
         return
 
     logger.info("Fetch cycle started for %d user(s).", len(active_users))
 
     async with aiohttp.ClientSession() as session:
-        leads = await fetch_new_pairs(session)
+        # 1. Fetch pairs from all chains
+        all_pairs = []
+        for chain in CHAINS:
+            pairs = await fetch_pairs_for_chain(session, chain.strip())
+            all_pairs.extend(pairs)
 
+        logger.info("Total pairs fetched: %d", len(all_pairs))
+
+        # 2. Extract leads with Telegram
+        leads = []
+        for pair in all_pairs:
+            lead = process_lead(pair)
+            if lead:
+                leads.append(lead)
+
+        logger.info("Leads with Telegram: %d", len(leads))
+        if leads:
+            # Log a sample
+            sample = leads[0]
+            logger.info(
+                "Sample lead: %s | tg=%s | liq=$%.2f | chain=%s",
+                sample["name"], sample["tg"], sample["liquidity"], sample["chain"]
+            )
+
+        # 3. Filter and send (no message if zero leads)
         if not leads:
-            for _, chat_id, _ in active_users:
-                await context.bot.send_message(chat_id=chat_id, text="↪️ No new Telegram leads found this cycle.")
-            return
+            return  # silent
 
         sent_any = False
         for user_id, chat_id, min_liq in active_users:
@@ -205,6 +237,7 @@ async def job_fetch_and_send(context: ContextTypes.DEFAULT_TYPE):
                     continue
                 if await is_duplicate(lead["tg"]):
                     continue
+
                 msg = (
                     f"🚀 Project: {lead['name']}\n"
                     f"🔗 Telegram: {lead['tg']}\n"
@@ -224,9 +257,9 @@ async def job_fetch_and_send(context: ContextTypes.DEFAULT_TYPE):
             if user_sent > 0:
                 sent_any = True
                 logger.info("Sent %d lead(s) to user %s", user_sent, user_id)
+
         if not sent_any:
-            for _, chat_id, _ in active_users:
-                await context.bot.send_message(chat_id=chat_id, text="↪️ No new Telegram leads found this cycle.")
+            logger.info("No leads above liquidity threshold for any user.")
 
 # ----------------------------------------------------------------------
 # Command handlers
