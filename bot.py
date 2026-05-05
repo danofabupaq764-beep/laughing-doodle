@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Dexscreener Telegram Lead Bot – DM Only
-Hosting‑ready version for Railway with persistent SQLite storage.
+Hosting-ready version for Railway with persistent SQLite storage.
 """
 
 import asyncio
@@ -35,6 +35,8 @@ logger = logging.getLogger(__name__)
 # Database helpers
 # ----------------------------------------------------------------------
 async def init_db():
+    """Create tables if they don't exist. Uses hardcoded default for SQLite
+    because 'DEFAULT ?' is not allowed."""
     os.makedirs(os.path.dirname(DB_PATH) or ".", exist_ok=True)
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("""
@@ -48,9 +50,9 @@ async def init_db():
                 user_id INTEGER PRIMARY KEY,
                 chat_id INTEGER NOT NULL,
                 active INTEGER DEFAULT 1,
-                min_liquidity REAL DEFAULT ?
+                min_liquidity REAL DEFAULT 5000.0
             )
-        """, (DEFAULT_MIN_LIQUIDITY,))
+        """)
         await db.commit()
 
 async def get_active_users():
