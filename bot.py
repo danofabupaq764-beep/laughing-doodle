@@ -115,6 +115,7 @@ async def fetch_latest_profiles(session: aiohttp.ClientSession) -> list[dict]:
             if resp.status == 200:
                 data = await resp.json()
                 if isinstance(data, list):
+                    logger.info("Fetched %d profiles from Dexscreener.", len(data))
                     return data
                 logger.warning("Unexpected API response format: %s", type(data))
             else:
@@ -151,11 +152,15 @@ async def fetch_liquidity_batch(session: aiohttp.ClientSession, addresses: list[
 async def job_fetch_and_send(context: ContextTypes.DEFAULT_TYPE):
     active_users = await get_active_users()
     if not active_users:
+        logger.info("No active users. Skipping fetch.")
         return
+
+    logger.info("Starting fetch cycle for %d active user(s).", len(active_users))
 
     async with aiohttp.ClientSession() as session:
         profiles = await fetch_latest_profiles(session)
         if not profiles:
+            logger.info("No profiles returned. Cycle finished.")
             return
 
         candidates = []
@@ -197,6 +202,7 @@ async def job_fetch_and_send(context: ContextTypes.DEFAULT_TYPE):
                 "full_addr": full_addr,
             })
 
+        logger.info("Candidate tokens with Telegram after filtering: %d", len(candidates))
         if not candidates:
             return
 
@@ -204,6 +210,7 @@ async def job_fetch_and_send(context: ContextTypes.DEFAULT_TYPE):
             session, [c["full_addr"] for c in candidates]
         )
 
+        sent_count = 0
         for user_id, chat_id, min_liq in active_users:
             for cand in candidates:
                 total_liq = liq_map.get(cand["addr"], 0.0)
@@ -223,11 +230,14 @@ async def job_fetch_and_send(context: ContextTypes.DEFAULT_TYPE):
                     logger.info("Sent %s to user %s", cand['name'], user_id)
                     await mark_as_sent(cand["tg"])
                     seen_now.add(cand["tg"])
+                    sent_count += 1
                 except Exception as e:
                     logger.error("Send failed to user %s: %s", user_id, e)
                     if "Forbidden" in str(e):
                         await set_active(user_id, False)
                         logger.info("User %s deactivated", user_id)
+
+        logger.info("Sent %d lead(s) this cycle.", sent_count)
 
 # ----------------------------------------------------------------------
 # Command handlers
@@ -269,8 +279,6 @@ async def cmd_minliq(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # Setup & run
 # ----------------------------------------------------------------------
 async def build_bot():
-    """Async initialisation (database, handlers, job queue).
-    Returns the fully configured Application."""
     await init_db()
     app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", cmd_start))
@@ -281,9 +289,7 @@ async def build_bot():
     return app
 
 def main():
-    # Run async setup to get the app
     app = asyncio.run(build_bot())
-    # Then start polling – this call is blocking and manages the event loop itself
     logger.info("Bot polling started.")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
