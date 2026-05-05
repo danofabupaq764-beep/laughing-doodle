@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
-Dexscreener Telegram Lead Bot – DM Only (diagnostic version)
+Dexscreener Telegram Lead Bot – DM Only
+Final diagnostic – dumps raw first pair to find Telegram key.
 """
 
 import asyncio
@@ -30,7 +31,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ----------------------------------------------------------------------
-# Database helpers (unchanged)
+# Database helpers
 # ----------------------------------------------------------------------
 async def init_db():
     os.makedirs(os.path.dirname(DB_PATH) or ".", exist_ok=True)
@@ -127,11 +128,7 @@ async def fetch_token_addresses(session: aiohttp.ClientSession, url: str, label:
         logger.error("%s: request failed: %s", label, e)
     return addresses
 
-def find_telegram(socials: list) -> str | None:
-    """
-    Robust Telegram detection. Checks type, label, and URL itself.
-    Logs a warning if a possible candidate is found but not matched.
-    """
+def find_telegram_in_socials(socials: list) -> str | None:
     for s in socials:
         if not isinstance(s, dict):
             continue
@@ -140,26 +137,18 @@ def find_telegram(socials: list) -> str | None:
             continue
         stype = s.get("type", "").lower()
         slabel = s.get("label", "").lower()
-        # Known patterns
-        if "telegram" in stype or "tg" in stype:
-            return url if url.startswith("http") else f"https://{url}"
-        if "telegram" in slabel or "tg" in slabel:
-            return url if url.startswith("http") else f"https://{url}"
-        # Check URL itself for common Telegram domains
-        if "t.me" in url or "telegram.me" in url or "telegram.org" in url:
-            return url if url.startswith("http") else f"https://{url}"
-        # Extra fallback: if URL contains "telegram" at all
-        if "telegram" in url.lower():
+        if "telegram" in stype or "tg" in stype or \
+           "telegram" in slabel or "tg" in slabel or \
+           "t.me" in url or "telegram.me" in url or "telegram.org" in url:
             return url if url.startswith("http") else f"https://{url}"
     return None
 
 async def fetch_pair_data(session: aiohttp.ClientSession, addresses: set[str]) -> list[dict]:
-    """Batch‑fetch pairs and return leads with Telegram links."""
     leads = []
     base_url = "https://api.dexscreener.com/latest/dex/tokens/"
     addr_list = list(addresses)
     chunk_size = 30
-    sample_logged = False
+    dumped = False
 
     for i in range(0, len(addr_list), chunk_size):
         chunk = addr_list[i:i + chunk_size]
@@ -168,30 +157,39 @@ async def fetch_pair_data(session: aiohttp.ClientSession, addresses: set[str]) -
             async with session.get(url) as resp:
                 if resp.status == 200:
                     data = await resp.json()
-                    pairs = data.get("pairs") or []   # handle null
-                    for idx, pair in enumerate(pairs):
+                    pairs = data.get("pairs") or []
+                    for pair in pairs:
+                        # Dump the first pair we see for diagnostics
+                        if not dumped and pair:
+                            logger.info("DIAGNOSTIC RAW PAIR DATA: %s", json.dumps(pair, indent=2))
+                            dumped = True
+
+                        info = pair.get("info") or {}
+                        socials = info.get("socials", [])
+                        tg = find_telegram_in_socials(socials)
+
+                        # Fallbacks: check info.chat, info.telegram, pair.url
+                        if not tg:
+                            chat = info.get("chat")
+                            if chat and isinstance(chat, str):
+                                if chat.startswith("http") or "t.me" in chat:
+                                    tg = chat if chat.startswith("http") else f"https://{chat}"
+                        if not tg:
+                            telegram_field = info.get("telegram")
+                            if telegram_field and isinstance(telegram_field, str):
+                                tg = telegram_field if telegram_field.startswith("http") else f"https://{telegram_field}"
+                        if not tg:
+                            pair_url = pair.get("url")
+                            if pair_url and isinstance(pair_url, str) and ("t.me" in pair_url or "telegram" in pair_url.lower()):
+                                tg = pair_url if pair_url.startswith("http") else f"https://{pair_url}"
+
+                        if not tg:
+                            continue
+
                         base = pair.get("baseToken", {})
-                        addr = base.get("address")
                         name = base.get("name", "?")
                         chain = pair.get("chainId", "?")
                         liquidity = pair.get("liquidity", {}).get("usd", 0)
-                        info = pair.get("info") or {}
-                        socials = info.get("socials", [])
-
-                        # Diagnostic: log first 3 pairs' socials
-                        if not sample_logged and idx < 3:
-                            logger.info(
-                                "Sample pair %d: name=%s socials=%s",
-                                idx + 1,
-                                name,
-                                json.dumps(socials),
-                            )
-                            if idx == 2:
-                                sample_logged = True
-
-                        tg = find_telegram(socials)
-                        if not tg:
-                            continue
 
                         twitter = website = None
                         for s in socials:
@@ -210,7 +208,7 @@ async def fetch_pair_data(session: aiohttp.ClientSession, addresses: set[str]) -
                             "tg": tg,
                             "tw": twitter,
                             "web": website,
-                            "addr": addr,
+                            "addr": base.get("address", ""),
                             "liquidity": liquidity,
                         })
                 else:
@@ -242,9 +240,7 @@ async def job_fetch_and_send(context: ContextTypes.DEFAULT_TYPE):
 
         if not all_addresses:
             for _, chat_id, _ in active_users:
-                await context.bot.send_message(
-                    chat_id=chat_id, text="ℹ️ No token addresses from Dexscreener."
-                )
+                await context.bot.send_message(chat_id=chat_id, text="ℹ️ No token addresses.")
             return
 
         leads = await fetch_pair_data(session, all_addresses)
@@ -252,9 +248,7 @@ async def job_fetch_and_send(context: ContextTypes.DEFAULT_TYPE):
 
         if not leads:
             for _, chat_id, _ in active_users:
-                await context.bot.send_message(
-                    chat_id=chat_id, text="↪️ No new Telegram leads found this cycle."
-                )
+                await context.bot.send_message(chat_id=chat_id, text="↪️ No new Telegram leads found.")
             return
 
         sent_any = False
@@ -265,7 +259,6 @@ async def job_fetch_and_send(context: ContextTypes.DEFAULT_TYPE):
                     continue
                 if await is_duplicate(lead["tg"]):
                     continue
-
                 msg = (
                     f"🚀 Project: {lead['name']}\n"
                     f"🔗 Telegram: {lead['tg']}\n"
@@ -279,21 +272,15 @@ async def job_fetch_and_send(context: ContextTypes.DEFAULT_TYPE):
                     user_sent += 1
                     await mark_as_sent(lead["tg"])
                 except Exception as e:
-                    logger.error("Send failed for user %s: %s", user_id, e)
+                    logger.error("Send failed user %s: %s", user_id, e)
                     if "Forbidden" in str(e):
                         await set_active(user_id, False)
-
             if user_sent > 0:
                 sent_any = True
                 logger.info("Sent %d lead(s) to user %s", user_sent, user_id)
-            else:
-                logger.info("No leads above liquidity for user %s", user_id)
-
         if not sent_any:
             for _, chat_id, _ in active_users:
-                await context.bot.send_message(
-                    chat_id=chat_id, text="↪️ No new Telegram leads found this cycle."
-                )
+                await context.bot.send_message(chat_id=chat_id, text="↪️ No new Telegram leads found.")
 
 # ----------------------------------------------------------------------
 # Command handlers
