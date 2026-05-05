@@ -1,17 +1,13 @@
 #!/usr/bin/env python3
 """
-Dexscreener Telegram Lead Bot – DM Only (stable)
-- Per‑chain search for live pairs (no 404).
-- Only ≤24h launches.
-- Telegram extracted from socials + info dict.
-- Silent‑cycle counter stored in bot_data (no AttributeError).
+Dexscreener Telegram Lead Bot – DM Only
+Stable, no age filter – extracts Telegram from live pairs.
 """
 
 import asyncio
 import logging
 import os
 import sys
-import time
 
 import aiohttp
 import aiosqlite
@@ -26,8 +22,7 @@ if not BOT_TOKEN:
 DB_PATH = os.getenv("DB_PATH", "leads.db")
 FETCH_INTERVAL = int(os.getenv("FETCH_INTERVAL", "45"))
 DEFAULT_MIN_LIQUIDITY = float(os.getenv("DEFAULT_MIN_LIQUIDITY", "50"))
-CHAINS = os.getenv("CHAINS", "bsc,ethereum,solana,avalanche,polygon,base,arbitrum,optimism").split(",")
-MAX_PAIR_AGE_HOURS = int(os.getenv("MAX_PAIR_AGE_HOURS", "24"))
+CHAINS = os.getenv("CHAINS", "bsc,ethereum,solana,avalanche,base,arbitrum,optimism,polygon").split(",")
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -111,9 +106,10 @@ async def set_min_liquidity(user_id: int, value: float):
         await db.commit()
 
 # ----------------------------------------------------------------------
-# Telegram extraction
+# Telegram extraction (proven logic)
 # ----------------------------------------------------------------------
 def find_tg(socials: list, info: dict) -> str | None:
+    # 1. socials array
     for s in (socials or []):
         if not isinstance(s, dict):
             continue
@@ -124,6 +120,7 @@ def find_tg(socials: list, info: dict) -> str | None:
         if any(w in t for w in ("telegram", "tg")) or \
            any(d in url for d in ("t.me", "telegram.me", "telegram.org")):
             return url if url.startswith("http") else f"https://{url}"
+    # 2. info dict fallback
     for key in ("telegram", "tg"):
         val = (info or {}).get(key)
         if val and isinstance(val, str) and "t.me" in val:
@@ -131,7 +128,7 @@ def find_tg(socials: list, info: dict) -> str | None:
     return None
 
 # ----------------------------------------------------------------------
-# Search (no 404)
+# Search chain (no age filter)
 # ----------------------------------------------------------------------
 async def search_chain(session: aiohttp.ClientSession, query: str) -> list[dict]:
     url = f"https://api.dexscreener.com/latest/dex/search?q={query}"
@@ -146,16 +143,7 @@ async def search_chain(session: aiohttp.ClientSession, query: str) -> list[dict]
         logger.error("Search '%s' error: %s", query, e)
     return []
 
-def is_recent(pair: dict) -> bool:
-    created_at = pair.get("pairCreatedAt")
-    if not created_at:
-        return False
-    age_seconds = (time.time() * 1000 - created_at) / 1000
-    return age_seconds < MAX_PAIR_AGE_HOURS * 3600
-
-def process(pair: dict) -> dict | None:
-    if not is_recent(pair):
-        return None
+def process_pair(pair: dict) -> dict | None:
     base = pair.get("baseToken") or {}
     name = base.get("name") or base.get("symbol") or "?"
     chain = pair.get("chainId", "?")
@@ -185,10 +173,7 @@ async def job_fetch_and_send(context: ContextTypes.DEFAULT_TYPE):
     if not active_users:
         return
 
-    # silent cycle counter in bot_data (safe)
-    silent = context.bot_data.setdefault("silent_cycles", 0)
-
-    logger.info("Fetch cycle (silent=%d)", silent)
+    logger.info("Fetch started")
 
     async with aiohttp.ClientSession() as s:
         all_pairs = []
@@ -202,18 +187,22 @@ async def job_fetch_and_send(context: ContextTypes.DEFAULT_TYPE):
             addr = p.get("pairAddress")
             if addr and addr not in unique:
                 unique[addr] = p
-        logger.info("Unique pairs fetched: %d", len(unique))
+
+        logger.info("Unique pairs: %d", len(unique))
 
         leads = []
         for p in unique.values():
-            ld = process(p)
+            ld = process_pair(p)
             if ld:
                 leads.append(ld)
 
-        logger.info("Fresh leads with Telegram (≤%dh): %d", MAX_PAIR_AGE_HOURS, len(leads))
+        logger.info("Telegram leads: %d", len(leads))
         if leads:
             sample = leads[0]
             logger.info("Sample: %s | tg=%s | liq=$%.2f", sample["name"], sample["tg"], sample["liquidity"])
+
+        if not leads:
+            return  # silent – no leads, no message
 
         sent_any = False
         for uid, cid, minliq in active_users:
@@ -241,20 +230,10 @@ async def job_fetch_and_send(context: ContextTypes.DEFAULT_TYPE):
                         await set_active(uid, False)
             if sent:
                 sent_any = True
-                logger.info("Sent %d lead(s) to user %s", sent, uid)
+                logger.info("Sent %d to user %s", sent, uid)
 
-        # Update silent cycles
-        if sent_any:
-            context.bot_data["silent_cycles"] = 0
-        else:
-            context.bot_data["silent_cycles"] = silent + 1
-            if context.bot_data["silent_cycles"] >= 10:
-                for _, cid, _ in active_users:
-                    await context.bot.send_message(
-                        chat_id=cid,
-                        text="ℹ️ No new Telegram leads in the last 10 cycles. Still watching for fresh launches."
-                    )
-                context.bot_data["silent_cycles"] = 0
+        if not sent_any:
+            logger.info("All leads filtered (duplicates/liquidity).")
 
 # ----------------------------------------------------------------------
 # Command handlers
@@ -267,7 +246,10 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         cur = await db.execute("SELECT min_liquidity FROM users WHERE user_id=?", (u.id,))
         row = await cur.fetchone()
         ml = row[0] if row else DEFAULT_MIN_LIQUIDITY
-    await update.message.reply_text(f"✅ Bot activated!\nMinimum liquidity: ${ml:,.2f}\nUse /minliq <value> to change.\n/stop to pause.")
+    await update.message.reply_text(
+        f"✅ Bot activated!\nMinimum liquidity: ${ml:,.2f}\n"
+        "Use /minliq <value> to change.\n/stop to pause."
+    )
 
 async def cmd_stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await set_active(update.effective_user.id, False)
