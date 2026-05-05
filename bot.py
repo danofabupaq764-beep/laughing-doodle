@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
 """
 Dexscreener Telegram Lead Bot – DM Only
-Diagnostic version – logs raw link data from first few tokens.
+Final version – finds Telegram links in profiles AND pair socials.
 """
 
 import asyncio
-import json
 import logging
 import os
 import sys
@@ -15,8 +14,6 @@ import aiosqlite
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 
-# ----------------------------------------------------------------------
-# Configuration
 # ----------------------------------------------------------------------
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 if not BOT_TOKEN:
@@ -33,7 +30,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ----------------------------------------------------------------------
-# Database helpers
+# Database helpers (unchanged)
 # ----------------------------------------------------------------------
 async def init_db():
     os.makedirs(os.path.dirname(DB_PATH) or ".", exist_ok=True)
@@ -107,29 +104,64 @@ async def set_min_liquidity(user_id: int, value: float):
         await db.commit()
 
 # ----------------------------------------------------------------------
-# Dexscreener API helpers
+# Dexscreener API – generalised Telegram detection
 # ----------------------------------------------------------------------
-async def fetch_profiles(session: aiohttp.ClientSession, url: str, label: str) -> list[dict]:
+def find_telegram(links: list) -> str | None:
+    """
+    Search a list of link objects for a Telegram URL.
+    Checks 'type', 'label', and the URL itself.
+    Returns a clean https://t.me/... URL, or None.
+    """
+    for link in links:
+        if not isinstance(link, dict):
+            continue
+        url = link.get("url", "")
+        if not url:
+            continue
+
+        # Check type & label
+        link_type = link.get("type", "").lower()
+        link_label = link.get("label", "").lower()
+        if "telegram" in link_type or "tg" in link_type or \
+           "telegram" in link_label or "tg" in link_label:
+            return url if url.startswith("http") else f"https://{url}"
+
+        # Check the URL itself for t.me
+        if "t.me" in url:
+            # Could be an invite or channel
+            if not url.startswith("http"):
+                url = f"https://{url}"
+            return url
+    return None
+
+async def fetch_pair_details(session: aiohttp.ClientSession, chain_id: str, pair_address: str) -> dict | None:
+    """Get a single pair's data, including socials."""
+    url = f"https://api.dexscreener.com/latest/dex/pairs/{chain_id}/{pair_address}"
     try:
         async with session.get(url) as resp:
             if resp.status == 200:
                 data = await resp.json()
-                if isinstance(data, list):
-                    logger.info("%s: fetched %d profiles.", label, len(data))
-                    return data
-                logger.warning("%s: unexpected response format %s", label, type(data))
-            else:
-                logger.error("%s: returned status %s", label, resp.status)
+                pairs = data.get("pair")
+                return pairs  # could be None if not found
     except Exception as e:
-        logger.error("%s: request failed: %s", label, e)
-    return []
+        logger.error("Pair fetch error: %s", e)
+    return None
 
-async def fetch_liquidity_batch(session: aiohttp.ClientSession, addresses: list[str]) -> dict:
-    result = {}
+async def fetch_liquidity_and_socials(
+    session: aiohttp.ClientSession, addresses: list[dict]
+) -> list[dict]:
+    """
+    For each candidate (with chain:address), fetch pairs and extract
+    total liquidity AND a Telegram link if not already found.
+    Returns a list of enriched candidate dicts.
+    """
+    # First, batch-fetch liquidity for all tokens
     base_url = "https://api.dexscreener.com/latest/dex/tokens/"
+    liq_map = {}
     chunk_size = 30
-    for i in range(0, len(addresses), chunk_size):
-        chunk = addresses[i:i + chunk_size]
+    chain_addr_list = [f"{c['chainId']}:{c['tokenAddress']}" for c in addresses]
+    for i in range(0, len(chain_addr_list), chunk_size):
+        chunk = chain_addr_list[i:i + chunk_size]
         url = base_url + ",".join(chunk)
         try:
             async with session.get(url) as resp:
@@ -141,51 +173,72 @@ async def fetch_liquidity_batch(session: aiohttp.ClientSession, addresses: list[
                         if not addr:
                             continue
                         liq = pair.get("liquidity", {}).get("usd", 0)
-                        result[addr] = result.get(addr, 0) + liq
+                        liq_map[addr] = liq_map.get(addr, 0) + liq
         except Exception as e:
             logger.error("Liquidity batch error: %s", e)
-    return result
 
-def extract_token_info(token: dict) -> dict | None:
-    if not all(k in token for k in ("name", "chainId", "tokenAddress", "links")):
-        return None
+    # Now enrich each candidate with liquidity and possibly Telegram from pairs
+    enriched = []
+    for cand in addresses:
+        total_liq = liq_map.get(cand["tokenAddress"], 0.0)
+        tg = cand.get("tg")
+        if not tg:
+            # Try to get Telegram from the first pair's socials
+            # Use the token's pair address if available, else fetch from chain+address pairs list
+            pair_addr = cand.get("pairAddress")
+            if pair_addr:
+                pair_data = await fetch_pair_details(session, cand["chainId"], pair_addr)
+                if pair_data:
+                    socials = pair_data.get("info", {}).get("socials", [])
+                    tg = find_telegram(socials)
+            if not tg:
+                # fallback: fetch pairs list for the token and check each
+                token_url = f"https://api.dexscreener.com/latest/dex/tokens/{cand['chainId']}:{cand['tokenAddress']}"
+                try:
+                    async with session.get(token_url) as resp:
+                        if resp.status == 200:
+                            data = await resp.json()
+                            for pair in data.get("pairs", []):
+                                socials = pair.get("info", {}).get("socials", [])
+                                tg = find_telegram(socials)
+                                if tg:
+                                    break
+                except Exception:
+                    pass
 
-    tg_link = None
-    twitter = None
-    website = None
-    for link in token.get("links", []):
-        if isinstance(link, dict):
-            lt = link.get("type", "").lower()
-            url = link.get("url", "")
-            if not url:
-                continue
-            if lt == "telegram" and url.startswith("http"):
-                tg_link = url
-            elif lt == "twitter":
-                twitter = url
-            elif lt == "website":
-                website = url
+        enriched.append({
+            "name": cand.get("name", "?"),
+            "chain": cand["chainId"],
+            "tg": tg,
+            "tw": cand.get("tw"),
+            "web": cand.get("web"),
+            "addr": cand["tokenAddress"],
+            "liquidity": total_liq,
+        })
+    return enriched
 
-    if not tg_link:
-        return None
-
-    return {
-        "name": token["name"],
-        "chain": token["chainId"],
-        "tg": tg_link,
-        "tw": twitter,
-        "web": website,
-        "addr": token["tokenAddress"],
-        "full_addr": f"{token['chainId']}:{token['tokenAddress']}",
-    }
+async def fetch_profiles(session: aiohttp.ClientSession, url: str, label: str) -> list[dict]:
+    try:
+        async with session.get(url) as resp:
+            if resp.status == 200:
+                data = await resp.json()
+                if isinstance(data, list):
+                    logger.info("%s: fetched %d profiles.", label, len(data))
+                    return data
+                logger.warning("%s: unexpected format %s", label, type(data))
+            else:
+                logger.error("%s: status %s", label, resp.status)
+    except Exception as e:
+        logger.error("%s: request failed: %s", label, e)
+    return []
 
 # ----------------------------------------------------------------------
-# Main fetch & send loop
+# Main job
 # ----------------------------------------------------------------------
 async def job_fetch_and_send(context: ContextTypes.DEFAULT_TYPE):
     active_users = await get_active_users()
     if not active_users:
-        logger.info("No active users. Skipping.")
+        logger.info("No active users.")
         return
 
     logger.info("Fetch cycle started for %d user(s).", len(active_users))
@@ -201,64 +254,69 @@ async def job_fetch_and_send(context: ContextTypes.DEFAULT_TYPE):
             "https://api.dexscreener.com/token-boosts/latest/v1",
             "Boosted tokens",
         )
-
         all_profiles = profiles_latest + profiles_boosted
         logger.info("Total profiles collected: %d", len(all_profiles))
-
-        # --- DIAGNOSTIC: log first 3 tokens' full links ---
-        for i, tok in enumerate(all_profiles[:3]):
-            logger.info(
-                "Sample token %d: name=%s links=%s",
-                i + 1,
-                tok.get("name", "?"),
-                json.dumps(tok.get("links", [])),
-            )
-        # ------------------------------------------------
 
         if not all_profiles:
             for _, chat_id, _ in active_users:
                 await context.bot.send_message(
-                    chat_id=chat_id, text="ℹ️ Dexscreener returned no profiles this cycle."
+                    chat_id=chat_id, text="ℹ️ No profiles from Dexscreener."
                 )
             return
 
-        candidates = []
+        # Extract basic info and Telegram if already in profile links
+        raw_candidates = []
         seen_tg = set()
         for token in all_profiles:
-            info = extract_token_info(token)
-            if not info:
+            if not all(k in token for k in ("name", "chainId", "tokenAddress", "links")):
                 continue
-            if info["tg"] in seen_tg or await is_duplicate(info["tg"]):
+            tg = find_telegram(token.get("links", []))
+            if tg and (tg in seen_tg or await is_duplicate(tg)):
                 continue
-            seen_tg.add(info["tg"])
-            candidates.append(info)
+            if tg:
+                seen_tg.add(tg)
+            raw_candidates.append({
+                "name": token["name"],
+                "chainId": token["chainId"],
+                "tokenAddress": token["tokenAddress"],
+                "tg": tg,
+                "tw": next((l["url"] for l in token["links"] if isinstance(l, dict) and l.get("type") == "twitter"), None),
+                "web": next((l["url"] for l in token["links"] if isinstance(l, dict) and ("website" in l.get("type", "").lower() or "website" in l.get("label", "").lower())), None),
+                "pairAddress": token.get("pairAddress"),  # may exist in profiles
+            })
 
-        logger.info("Candidates with Telegram (after dedup): %d", len(candidates))
-        if not candidates:
-            for _, chat_id, _ in active_users:
-                await context.bot.send_message(
-                    chat_id=chat_id, text="↪️ No new Telegram leads found this cycle."
-                )
-            return
+        # Deduplicate by tokenAddress
+        unique = {}
+        for c in raw_candidates:
+            addr = c["tokenAddress"]
+            if addr not in unique:
+                unique[addr] = c
+            else:
+                # keep the one with Telegram if possible
+                if c["tg"] and not unique[addr]["tg"]:
+                    unique[addr] = c
 
-        liq_map = await fetch_liquidity_batch(
-            session, [c["full_addr"] for c in candidates]
-        )
+        candidates_list = list(unique.values())
+        logger.info("Unique tokens before liquidity/social enrichment: %d", len(candidates_list))
 
+        # Enrich with liquidity and possibly Telegram from pair socials
+        enriched = await fetch_liquidity_and_socials(session, candidates_list)
+
+        # Filter by user min_liquidity and send
         sent_any = False
         for user_id, chat_id, min_liq in active_users:
             user_sent = 0
-            for cand in candidates:
-                total_liq = liq_map.get(cand["addr"], 0.0)
-                if total_liq < min_liq:
+            for cand in enriched:
+                if not cand["tg"]:
                     continue
-
+                if cand["liquidity"] < min_liq:
+                    continue
                 msg = (
                     f"🚀 Project: {cand['name']}\n"
                     f"🔗 Telegram: {cand['tg']}\n"
                     f"🐦 Twitter: {cand['tw'] or 'NIL'}\n"
                     f"🌐 Website: {cand['web'] or 'NIL'}\n"
-                    f"💧 Liquidity: ${total_liq:,.2f}\n"
+                    f"💧 Liquidity: ${cand['liquidity']:,.2f}\n"
                     f"⛓ Chain: {cand['chain']}"
                 )
                 try:
@@ -266,21 +324,19 @@ async def job_fetch_and_send(context: ContextTypes.DEFAULT_TYPE):
                     user_sent += 1
                     await mark_as_sent(cand["tg"])
                 except Exception as e:
-                    logger.error("Send failed to user %s: %s", user_id, e)
+                    logger.error("Send failed user %s: %s", user_id, e)
                     if "Forbidden" in str(e):
                         await set_active(user_id, False)
-                        logger.info("User %s deactivated", user_id)
             if user_sent > 0:
                 sent_any = True
-                logger.info("Sent %d leads to user %s", user_sent, user_id)
+                logger.info("Sent %d lead(s) to user %s", user_sent, user_id)
             else:
-                logger.info("No leads met liquidity threshold for user %s", user_id)
+                logger.info("No leads above liquidity for user %s", user_id)
 
         if not sent_any:
             for _, chat_id, _ in active_users:
                 await context.bot.send_message(
-                    chat_id=chat_id,
-                    text="⏳ Candidates found but all below your minimum liquidity.",
+                    chat_id=chat_id, text="↪️ No new Telegram leads found this cycle."
                 )
 
 # ----------------------------------------------------------------------
@@ -320,7 +376,7 @@ async def cmd_minliq(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"💰 Minimum liquidity set to ${value:,.2f}")
 
 # ----------------------------------------------------------------------
-# Setup & run
+# Run
 # ----------------------------------------------------------------------
 async def build_bot():
     await init_db()
