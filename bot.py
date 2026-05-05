@@ -106,22 +106,21 @@ async def set_min_liquidity(user_id: int, value: float):
         await db.commit()
 
 # ----------------------------------------------------------------------
-# Dexscreener API
+# Dexscreener API helpers
 # ----------------------------------------------------------------------
-async def fetch_latest_profiles(session: aiohttp.ClientSession) -> list[dict]:
-    url = "https://api.dexscreener.com/token-profiles/latest/v1"
+async def fetch_profiles(session: aiohttp.ClientSession, url: str, label: str) -> list[dict]:
     try:
         async with session.get(url) as resp:
             if resp.status == 200:
                 data = await resp.json()
                 if isinstance(data, list):
-                    logger.info("Fetched %d profiles from Dexscreener.", len(data))
+                    logger.info("%s: fetched %d profiles.", label, len(data))
                     return data
-                logger.warning("Unexpected API response format: %s", type(data))
+                logger.warning("%s: unexpected response format %s", label, type(data))
             else:
-                logger.error("Profiles API returned status %s", resp.status)
+                logger.error("%s: returned status %s", label, resp.status)
     except Exception as e:
-        logger.error("Error fetching profiles: %s", e)
+        logger.error("%s: request failed: %s", label, e)
     return []
 
 async def fetch_liquidity_batch(session: aiohttp.ClientSession, addresses: list[str]) -> dict:
@@ -143,8 +142,42 @@ async def fetch_liquidity_batch(session: aiohttp.ClientSession, addresses: list[
                         liq = pair.get("liquidity", {}).get("usd", 0)
                         result[addr] = result.get(addr, 0) + liq
         except Exception as e:
-            logger.error("Error fetching liquidity chunk: %s", e)
+            logger.error("Liquidity batch error: %s", e)
     return result
+
+def extract_token_info(token: dict) -> dict | None:
+    """Return a dict with name, chain, tg_link, tw, web, addr, full_addr, or None."""
+    if not all(k in token for k in ("name", "chainId", "tokenAddress", "links")):
+        return None
+
+    tg_link = None
+    twitter = None
+    website = None
+    for link in token.get("links", []):
+        if isinstance(link, dict):
+            lt = link.get("type", "").lower()
+            url = link.get("url", "")
+            if not url:
+                continue
+            if lt == "telegram" and url.startswith("http"):
+                tg_link = url
+            elif lt == "twitter":
+                twitter = url
+            elif lt == "website":
+                website = url
+
+    if not tg_link:
+        return None
+
+    return {
+        "name": token["name"],
+        "chain": token["chainId"],
+        "tg": tg_link,
+        "tw": twitter,
+        "web": website,
+        "addr": token["tokenAddress"],
+        "full_addr": f"{token['chainId']}:{token['tokenAddress']}",
+    }
 
 # ----------------------------------------------------------------------
 # Main fetch & send loop
@@ -152,66 +185,64 @@ async def fetch_liquidity_batch(session: aiohttp.ClientSession, addresses: list[
 async def job_fetch_and_send(context: ContextTypes.DEFAULT_TYPE):
     active_users = await get_active_users()
     if not active_users:
-        logger.info("No active users. Skipping fetch.")
+        logger.info("No active users. Skipping.")
         return
 
-    logger.info("Starting fetch cycle for %d active user(s).", len(active_users))
+    logger.info("Fetch cycle started for %d user(s).", len(active_users))
 
     async with aiohttp.ClientSession() as session:
-        profiles = await fetch_latest_profiles(session)
-        if not profiles:
-            logger.info("No profiles returned. Cycle finished.")
+        # 1. Fetch from two sources to increase chances
+        profiles_latest = await fetch_profiles(
+            session,
+            "https://api.dexscreener.com/token-profiles/latest/v1",
+            "Latest profiles",
+        )
+        profiles_boosted = await fetch_profiles(
+            session,
+            "https://api.dexscreener.com/token-boosts/latest/v1",
+            "Boosted tokens",
+        )
+
+        all_profiles = profiles_latest + profiles_boosted
+        logger.info("Total profiles collected: %d", len(all_profiles))
+
+        if not all_profiles:
+            # Send a "no data" message once per cycle
+            for _, chat_id, _ in active_users:
+                await context.bot.send_message(
+                    chat_id=chat_id, text="ℹ️ Dexscreener returned no profiles this cycle."
+                )
             return
 
+        # 2. Extract candidates with Telegram, deduplicate
         candidates = []
-        seen_now = set()
-
-        for token in profiles:
-            if not all(k in token for k in ("name", "chainId", "tokenAddress", "links")):
+        seen_tg = set()
+        for token in all_profiles:
+            info = extract_token_info(token)
+            if not info:
                 continue
-
-            tg_link = None
-            twitter = None
-            website = None
-            for link in token.get("links", []):
-                if isinstance(link, dict):
-                    lt = link.get("type", "").lower()
-                    url = link.get("url", "")
-                    if not url:
-                        continue
-                    if lt == "telegram" and url.startswith("http"):
-                        tg_link = url
-                    elif lt == "twitter":
-                        twitter = url
-                    elif lt == "website":
-                        website = url
-
-            if not tg_link:
+            if info["tg"] in seen_tg or await is_duplicate(info["tg"]):
                 continue
-            if tg_link in seen_now or await is_duplicate(tg_link):
-                continue
+            seen_tg.add(info["tg"])
+            candidates.append(info)
 
-            full_addr = f"{token['chainId']}:{token['tokenAddress']}"
-            candidates.append({
-                "name": token["name"],
-                "chain": token["chainId"],
-                "tg": tg_link,
-                "tw": twitter,
-                "web": website,
-                "addr": token["tokenAddress"],
-                "full_addr": full_addr,
-            })
-
-        logger.info("Candidate tokens with Telegram after filtering: %d", len(candidates))
+        logger.info("Candidates with Telegram (after dedup): %d", len(candidates))
         if not candidates:
+            for _, chat_id, _ in active_users:
+                await context.bot.send_message(
+                    chat_id=chat_id, text="↪️ No new Telegram leads found this cycle."
+                )
             return
 
+        # 3. Fetch liquidity
         liq_map = await fetch_liquidity_batch(
             session, [c["full_addr"] for c in candidates]
         )
 
-        sent_count = 0
+        # 4. Filter by user min_liq and send
+        sent_any = False
         for user_id, chat_id, min_liq in active_users:
+            user_sent = 0
             for cand in candidates:
                 total_liq = liq_map.get(cand["addr"], 0.0)
                 if total_liq < min_liq:
@@ -227,17 +258,25 @@ async def job_fetch_and_send(context: ContextTypes.DEFAULT_TYPE):
                 )
                 try:
                     await context.bot.send_message(chat_id=chat_id, text=msg)
-                    logger.info("Sent %s to user %s", cand['name'], user_id)
+                    user_sent += 1
                     await mark_as_sent(cand["tg"])
-                    seen_now.add(cand["tg"])
-                    sent_count += 1
                 except Exception as e:
                     logger.error("Send failed to user %s: %s", user_id, e)
                     if "Forbidden" in str(e):
                         await set_active(user_id, False)
                         logger.info("User %s deactivated", user_id)
+            if user_sent > 0:
+                sent_any = True
+                logger.info("Sent %d leads to user %s", user_sent, user_id)
+            else:
+                logger.info("No leads met liquidity threshold for user %s", user_id)
 
-        logger.info("Sent %d lead(s) this cycle.", sent_count)
+        if not sent_any:
+            for _, chat_id, _ in active_users:
+                await context.bot.send_message(
+                    chat_id=chat_id,
+                    text="⏳ Candidates found but all below your minimum liquidity.",
+                )
 
 # ----------------------------------------------------------------------
 # Command handlers
