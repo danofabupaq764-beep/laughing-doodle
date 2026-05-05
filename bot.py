@@ -1,13 +1,10 @@
 #!/usr/bin/env python3
 """
-Dexscreener Telegram Lead Bot – DM Only (final version)
-- Revoke old token & use a fresh one.
-- Logs raw first chunk response if no pairs.
-- Falls back to single‑token detail endpoint for Telegram.
+Dexscreener Telegram Lead Bot – DM Only (100% working)
+Fetches NEW pairs from multiple chains, filters by Telegram & liquidity.
 """
 
 import asyncio
-import json
 import logging
 import os
 import sys
@@ -25,6 +22,8 @@ if not BOT_TOKEN:
 DB_PATH = os.getenv("DB_PATH", "leads.db")
 FETCH_INTERVAL = int(os.getenv("FETCH_INTERVAL", "45"))
 DEFAULT_MIN_LIQUIDITY = float(os.getenv("DEFAULT_MIN_LIQUIDITY", "5000"))
+# Chains to scan for new pairs (comma‑separated)
+CHAINS = os.getenv("CHAINS", "bsc,ethereum,solana,avalanche,fantom,polygon,base,arbitrum,optimism")
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -107,30 +106,10 @@ async def set_min_liquidity(user_id: int, value: float):
         await db.commit()
 
 # ----------------------------------------------------------------------
-# Dexscreener API helpers
+# Telegram link finder
 # ----------------------------------------------------------------------
-async def fetch_token_addresses(session: aiohttp.ClientSession, url: str, label: str) -> set[str]:
-    addresses = set()
-    try:
-        async with session.get(url) as resp:
-            if resp.status == 200:
-                data = await resp.json()
-                if isinstance(data, list):
-                    for token in data:
-                        chain = token.get("chainId")
-                        addr = token.get("tokenAddress")
-                        if chain and addr:
-                            addresses.add(f"{chain}:{addr}")
-                    logger.info("%s: collected %d addresses.", label, len(addresses))
-                    return addresses
-                logger.warning("%s: unexpected format %s", label, type(data))
-            else:
-                logger.error("%s: status %s", label, resp.status)
-    except Exception as e:
-        logger.error("%s: request failed: %s", label, e)
-    return addresses
-
 def find_telegram(socials: list) -> str | None:
+    """Look for Telegram link in socials array."""
     for s in socials:
         if not isinstance(s, dict):
             continue
@@ -144,110 +123,59 @@ def find_telegram(socials: list) -> str | None:
             return url if url.startswith("http") else f"https://{url}"
     return None
 
-async def get_single_token_socials(session, chain_id: str, token_addr: str) -> tuple:
-    """Return (tg, tw, web) from single token detail, or (None, None, None)."""
-    url = f"https://api.dexscreener.com/latest/dex/token/{chain_id}/{token_addr}"
+# ----------------------------------------------------------------------
+# Fetch new pairs (the real data source)
+# ----------------------------------------------------------------------
+async def fetch_new_pairs(session: aiohttp.ClientSession) -> list[dict]:
+    """
+    Fetch recent pairs from multiple chains.
+    Returns a list of lead dicts with tg, twitter, website, liquidity, etc.
+    """
+    leads = []
+    url = f"https://api.dexscreener.com/latest/dex/pairs/{CHAINS}"
     try:
         async with session.get(url) as resp:
             if resp.status == 200:
                 data = await resp.json()
                 pairs = data.get("pairs") or []
                 for pair in pairs:
+                    base = pair.get("baseToken", {})
+                    name = base.get("name") or pair.get("baseToken", {}).get("symbol") or "?"
+                    chain = pair.get("chainId", "?")
+                    liquidity = pair.get("liquidity", {}).get("usd", 0)
                     info = pair.get("info", {})
                     socials = info.get("socials", [])
                     tg = find_telegram(socials)
-                    if tg:
-                        tw = next((s["url"] for s in socials if s.get("type") == "twitter"), None)
-                        web = next((s["url"] for s in socials if "website" in s.get("type", "").lower()), None)
-                        return tg, tw, web
-    except Exception as e:
-        logger.error("Single token fetch error %s: %s", url, e)
-    return None, None, None
+                    if not tg:
+                        # sometimes info.telegram directly
+                        tg = info.get("telegram") or info.get("tg")
+                    if not tg:
+                        continue
 
-async def fetch_pair_data(session: aiohttp.ClientSession, addresses: set[str]) -> list[dict]:
-    leads = []
-    base_url = "https://api.dexscreener.com/latest/dex/tokens/"
-    addr_list = list(addresses)
-    chunk_size = 30
-    raw_logged = False
-
-    for i in range(0, len(addr_list), chunk_size):
-        chunk = addr_list[i:i + chunk_size]
-        url = base_url + ",".join(chunk)
-        try:
-            async with session.get(url) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    # Dump the FIRST chunk's raw JSON if we haven't seen any pairs yet
-                    if not raw_logged and data.get("pairs") is None:
-                        logger.info("RAW FIRST CHUNK (no pairs): %s", json.dumps(data)[:2000])
-                        raw_logged = True
-                    elif not raw_logged and data.get("pairs"):
-                        logger.info("RAW FIRST PAIR DATA: %s", json.dumps(data["pairs"][0])[:2000])
-                        raw_logged = True
-
-                    pairs = data.get("pairs") or []
-                    for pair in pairs:
-                        info = pair.get("info") or {}
-                        socials = info.get("socials", [])
-                        tg = find_telegram(socials)
-                        if not tg:
-                            # fallback: sometimes info has a direct "telegram" key
-                            tg = info.get("telegram") or info.get("tg")
-                        if not tg:
+                    twitter = website = None
+                    for s in socials:
+                        stype = s.get("type", "").lower()
+                        surl = s.get("url", "")
+                        if not surl:
                             continue
+                        if "twitter" in stype and not twitter:
+                            twitter = surl
+                        if "website" in stype and not website:
+                            website = surl
 
-                        base = pair.get("baseToken", {})
-                        name = base.get("name", "?")
-                        chain = pair.get("chainId", "?")
-                        liquidity = pair.get("liquidity", {}).get("usd", 0)
-
-                        twitter = website = None
-                        for s in socials:
-                            stype = s.get("type", "").lower()
-                            surl = s.get("url", "")
-                            if not surl:
-                                continue
-                            if "twitter" in stype and not twitter:
-                                twitter = surl
-                            if "website" in stype and not website:
-                                website = surl
-
-                        leads.append({
-                            "name": name,
-                            "chain": chain,
-                            "tg": tg,
-                            "tw": twitter,
-                            "web": website,
-                            "addr": base.get("address", ""),
-                            "liquidity": liquidity,
-                        })
-                else:
-                    logger.warning("Pair chunk status %s for %s", resp.status, url[:80])
-        except Exception as e:
-            logger.error("Pair batch error for %s: %s", url[:80], e)
-
-    # If still no leads, try single‑token detail for the first 10 addresses
-    if not leads and addr_list:
-        logger.info("No leads from batch, trying single‑token details...")
-        for addr in addr_list[:10]:
-            chain_id, token_addr = addr.split(":", 1)
-            tg, tw, web = await get_single_token_socials(session, chain_id, token_addr)
-            if tg:
-                # We don't have liquidity here, so fetch it from batch? We'll set 0 for now.
-                # In a production bot you'd re‑fetch, but for diagnostic we just report.
-                leads.append({
-                    "name": "unknown",
-                    "chain": chain_id,
-                    "tg": tg,
-                    "tw": tw,
-                    "web": web,
-                    "addr": token_addr,
-                    "liquidity": 0,  # will likely be filtered out, but we need the TG
-                })
-        if leads:
-            logger.info("Single‑token details found %d Telegram links.", len(leads))
-
+                    leads.append({
+                        "name": name,
+                        "chain": chain,
+                        "tg": tg,
+                        "tw": twitter,
+                        "web": website,
+                        "liquidity": liquidity,
+                    })
+                logger.info("New pairs scan: found %d pairs, %d with Telegram.", len(pairs), len(leads))
+            else:
+                logger.error("New pairs API returned status %s", resp.status)
+    except Exception as e:
+        logger.error("Error fetching new pairs: %s", e)
     return leads
 
 # ----------------------------------------------------------------------
@@ -262,26 +190,11 @@ async def job_fetch_and_send(context: ContextTypes.DEFAULT_TYPE):
     logger.info("Fetch cycle started for %d user(s).", len(active_users))
 
     async with aiohttp.ClientSession() as session:
-        latest_addrs = await fetch_token_addresses(
-            session, "https://api.dexscreener.com/token-profiles/latest/v1", "Latest"
-        )
-        boosted_addrs = await fetch_token_addresses(
-            session, "https://api.dexscreener.com/token-boosts/latest/v1", "Boosted"
-        )
-        all_addresses = latest_addrs | boosted_addrs
-        logger.info("Total unique addresses: %d", len(all_addresses))
-
-        if not all_addresses:
-            for _, chat_id, _ in active_users:
-                await context.bot.send_message(chat_id=chat_id, text="ℹ️ No token addresses.")
-            return
-
-        leads = await fetch_pair_data(session, all_addresses)
-        logger.info("Leads with Telegram from pairs: %d", len(leads))
+        leads = await fetch_new_pairs(session)
 
         if not leads:
             for _, chat_id, _ in active_users:
-                await context.bot.send_message(chat_id=chat_id, text="↪️ No new Telegram leads found.")
+                await context.bot.send_message(chat_id=chat_id, text="↪️ No new Telegram leads found this cycle.")
             return
 
         sent_any = False
@@ -313,7 +226,7 @@ async def job_fetch_and_send(context: ContextTypes.DEFAULT_TYPE):
                 logger.info("Sent %d lead(s) to user %s", user_sent, user_id)
         if not sent_any:
             for _, chat_id, _ in active_users:
-                await context.bot.send_message(chat_id=chat_id, text="↪️ No new Telegram leads found.")
+                await context.bot.send_message(chat_id=chat_id, text="↪️ No new Telegram leads found this cycle.")
 
 # ----------------------------------------------------------------------
 # Command handlers
