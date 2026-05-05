@@ -21,7 +21,7 @@ if not BOT_TOKEN:
 
 DB_PATH = os.getenv("DB_PATH", "leads.db")
 FETCH_INTERVAL = int(os.getenv("FETCH_INTERVAL", "45"))
-DEFAULT_MIN_LIQUIDITY = float(os.getenv("DEFAULT_MIN_LIQUIDITY", "100"))  # Testing
+DEFAULT_MIN_LIQUIDITY = float(os.getenv("DEFAULT_MIN_LIQUIDITY", "100"))  # Low for testing
 CHAINS = os.getenv("CHAINS", "bsc,ethereum,solana,avalanche,fantom,polygon,base,arbitrum,optimism").split(",")
 
 logging.basicConfig(
@@ -42,14 +42,15 @@ async def init_db():
                 added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
+        # HARDCODED default – no parameter substitution
         await db.execute("""
             CREATE TABLE IF NOT EXISTS users (
                 user_id INTEGER PRIMARY KEY,
                 chat_id INTEGER NOT NULL,
                 active INTEGER DEFAULT 1,
-                min_liquidity REAL DEFAULT ?
+                min_liquidity REAL DEFAULT 100.0
             )
-        """, (DEFAULT_MIN_LIQUIDITY,))
+        """)
         await db.commit()
 
 async def get_active_users():
@@ -76,13 +77,15 @@ async def mark_as_sent(telegram_url: str):
 
 async def upsert_user(user_id: int, chat_id: int, active: bool = True):
     async with aiosqlite.connect(DB_PATH) as db:
+        # When upserting, we keep the existing min_liquidity or set the default
         await db.execute(
             """
             INSERT INTO users (user_id, chat_id, active, min_liquidity)
             VALUES (?, ?, ?, ?)
             ON CONFLICT(user_id) DO UPDATE SET
                 chat_id = excluded.chat_id,
-                active = excluded.active
+                active = excluded.active,
+                min_liquidity = COALESCE(users.min_liquidity, excluded.min_liquidity)
             """,
             (user_id, chat_id, int(active), DEFAULT_MIN_LIQUIDITY),
         )
@@ -108,11 +111,7 @@ async def set_min_liquidity(user_id: int, value: float):
 # Telegram link extraction
 # ----------------------------------------------------------------------
 def extract_telegram(socials: list, info: dict) -> str | None:
-    """
-    Search socials array and info dict for a Telegram URL.
-    Returns a normalized https://t.me/... link or None.
-    """
-    # 1. Check socials array
+    # 1. socials array
     for s in socials if isinstance(socials, list) else []:
         if not isinstance(s, dict):
             continue
@@ -125,20 +124,18 @@ def extract_telegram(socials: list, info: dict) -> str | None:
            any(d in url for d in ("t.me", "telegram.me", "telegram.org")):
             return url if url.startswith("http") else f"https://{url}"
 
-    # 2. Direct info fields
+    # 2. info dict direct keys
     for key in ("telegram", "tg"):
         val = info.get(key) if isinstance(info, dict) else None
         if val and isinstance(val, str):
             if "t.me" in val:
                 return val if val.startswith("http") else f"https://{val}"
-
     return None
 
 # ----------------------------------------------------------------------
 # Per‑chain pair fetcher
 # ----------------------------------------------------------------------
 async def fetch_pairs_for_chain(session: aiohttp.ClientSession, chain: str) -> list[dict]:
-    """Return list of raw pair dicts from a single chain."""
     url = f"https://api.dexscreener.com/latest/dex/pairs/{chain}"
     try:
         async with session.get(url) as resp:
@@ -154,10 +151,9 @@ async def fetch_pairs_for_chain(session: aiohttp.ClientSession, chain: str) -> l
     return []
 
 # ----------------------------------------------------------------------
-# Lead processing (extract info from all pairs)
+# Lead processing
 # ----------------------------------------------------------------------
 def process_lead(pair: dict) -> dict | None:
-    """Extract name, chain, tg, twitter, website, liquidity from a pair dict."""
     base = pair.get("baseToken", {})
     name = base.get("name") or base.get("symbol") or "?"
     chain = pair.get("chainId", "?")
@@ -201,7 +197,6 @@ async def job_fetch_and_send(context: ContextTypes.DEFAULT_TYPE):
     logger.info("Fetch cycle started for %d user(s).", len(active_users))
 
     async with aiohttp.ClientSession() as session:
-        # 1. Fetch pairs from all chains
         all_pairs = []
         for chain in CHAINS:
             pairs = await fetch_pairs_for_chain(session, chain.strip())
@@ -209,7 +204,6 @@ async def job_fetch_and_send(context: ContextTypes.DEFAULT_TYPE):
 
         logger.info("Total pairs fetched: %d", len(all_pairs))
 
-        # 2. Extract leads with Telegram
         leads = []
         for pair in all_pairs:
             lead = process_lead(pair)
@@ -218,14 +212,10 @@ async def job_fetch_and_send(context: ContextTypes.DEFAULT_TYPE):
 
         logger.info("Leads with Telegram: %d", len(leads))
         if leads:
-            # Log a sample
             sample = leads[0]
-            logger.info(
-                "Sample lead: %s | tg=%s | liq=$%.2f | chain=%s",
-                sample["name"], sample["tg"], sample["liquidity"], sample["chain"]
-            )
+            logger.info("Sample: %s | tg=%s | liq=$%.2f | chain=%s",
+                        sample["name"], sample["tg"], sample["liquidity"], sample["chain"])
 
-        # 3. Filter and send (no message if zero leads)
         if not leads:
             return  # silent
 
@@ -257,7 +247,6 @@ async def job_fetch_and_send(context: ContextTypes.DEFAULT_TYPE):
             if user_sent > 0:
                 sent_any = True
                 logger.info("Sent %d lead(s) to user %s", user_sent, user_id)
-
         if not sent_any:
             logger.info("No leads above liquidity threshold for any user.")
 
