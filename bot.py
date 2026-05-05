@@ -35,8 +35,6 @@ logger = logging.getLogger(__name__)
 # Database helpers
 # ----------------------------------------------------------------------
 async def init_db():
-    """Create tables if they don't exist. Uses hardcoded default for SQLite
-    because 'DEFAULT ?' is not allowed."""
     os.makedirs(os.path.dirname(DB_PATH) or ".", exist_ok=True)
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("""
