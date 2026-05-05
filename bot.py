@@ -266,20 +266,26 @@ async def cmd_minliq(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"💰 Minimum liquidity set to ${value:,.2f}")
 
 # ----------------------------------------------------------------------
-# Application main
+# Setup & run
 # ----------------------------------------------------------------------
-async def main():
+async def build_bot():
+    """Async initialisation (database, handlers, job queue).
+    Returns the fully configured Application."""
     await init_db()
     app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("stop", cmd_stop))
     app.add_handler(CommandHandler("minliq", cmd_minliq))
     app.job_queue.run_repeating(job_fetch_and_send, interval=FETCH_INTERVAL, first=10)
+    logger.info("Bot is ready.")
+    return app
+
+def main():
+    # Run async setup to get the app
+    app = asyncio.run(build_bot())
+    # Then start polling – this call is blocking and manages the event loop itself
     logger.info("Bot polling started.")
-    await app.run_polling(allowed_updates=Update.ALL_TYPES)
+    app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        logger.info("Bot stopped.")
+    main()
