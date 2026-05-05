@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """
-Dexscreener Telegram Lead Bot – DM Only
-Final diagnostic – dumps raw first pair to find Telegram key.
+Dexscreener Telegram Lead Bot – DM Only (final version)
+- Revoke old token & use a fresh one.
+- Logs raw first chunk response if no pairs.
+- Falls back to single‑token detail endpoint for Telegram.
 """
 
 import asyncio
@@ -128,7 +130,7 @@ async def fetch_token_addresses(session: aiohttp.ClientSession, url: str, label:
         logger.error("%s: request failed: %s", label, e)
     return addresses
 
-def find_telegram_in_socials(socials: list) -> str | None:
+def find_telegram(socials: list) -> str | None:
     for s in socials:
         if not isinstance(s, dict):
             continue
@@ -137,18 +139,37 @@ def find_telegram_in_socials(socials: list) -> str | None:
             continue
         stype = s.get("type", "").lower()
         slabel = s.get("label", "").lower()
-        if "telegram" in stype or "tg" in stype or \
-           "telegram" in slabel or "tg" in slabel or \
-           "t.me" in url or "telegram.me" in url or "telegram.org" in url:
+        if any(word in stype + slabel for word in ("telegram", "tg")) or \
+           any(d in url for d in ("t.me", "telegram.me", "telegram.org")):
             return url if url.startswith("http") else f"https://{url}"
     return None
+
+async def get_single_token_socials(session, chain_id: str, token_addr: str) -> tuple:
+    """Return (tg, tw, web) from single token detail, or (None, None, None)."""
+    url = f"https://api.dexscreener.com/latest/dex/token/{chain_id}/{token_addr}"
+    try:
+        async with session.get(url) as resp:
+            if resp.status == 200:
+                data = await resp.json()
+                pairs = data.get("pairs") or []
+                for pair in pairs:
+                    info = pair.get("info", {})
+                    socials = info.get("socials", [])
+                    tg = find_telegram(socials)
+                    if tg:
+                        tw = next((s["url"] for s in socials if s.get("type") == "twitter"), None)
+                        web = next((s["url"] for s in socials if "website" in s.get("type", "").lower()), None)
+                        return tg, tw, web
+    except Exception as e:
+        logger.error("Single token fetch error %s: %s", url, e)
+    return None, None, None
 
 async def fetch_pair_data(session: aiohttp.ClientSession, addresses: set[str]) -> list[dict]:
     leads = []
     base_url = "https://api.dexscreener.com/latest/dex/tokens/"
     addr_list = list(addresses)
     chunk_size = 30
-    dumped = False
+    raw_logged = False
 
     for i in range(0, len(addr_list), chunk_size):
         chunk = addr_list[i:i + chunk_size]
@@ -157,32 +178,22 @@ async def fetch_pair_data(session: aiohttp.ClientSession, addresses: set[str]) -
             async with session.get(url) as resp:
                 if resp.status == 200:
                     data = await resp.json()
+                    # Dump the FIRST chunk's raw JSON if we haven't seen any pairs yet
+                    if not raw_logged and data.get("pairs") is None:
+                        logger.info("RAW FIRST CHUNK (no pairs): %s", json.dumps(data)[:2000])
+                        raw_logged = True
+                    elif not raw_logged and data.get("pairs"):
+                        logger.info("RAW FIRST PAIR DATA: %s", json.dumps(data["pairs"][0])[:2000])
+                        raw_logged = True
+
                     pairs = data.get("pairs") or []
                     for pair in pairs:
-                        # Dump the first pair we see for diagnostics
-                        if not dumped and pair:
-                            logger.info("DIAGNOSTIC RAW PAIR DATA: %s", json.dumps(pair, indent=2))
-                            dumped = True
-
                         info = pair.get("info") or {}
                         socials = info.get("socials", [])
-                        tg = find_telegram_in_socials(socials)
-
-                        # Fallbacks: check info.chat, info.telegram, pair.url
+                        tg = find_telegram(socials)
                         if not tg:
-                            chat = info.get("chat")
-                            if chat and isinstance(chat, str):
-                                if chat.startswith("http") or "t.me" in chat:
-                                    tg = chat if chat.startswith("http") else f"https://{chat}"
-                        if not tg:
-                            telegram_field = info.get("telegram")
-                            if telegram_field and isinstance(telegram_field, str):
-                                tg = telegram_field if telegram_field.startswith("http") else f"https://{telegram_field}"
-                        if not tg:
-                            pair_url = pair.get("url")
-                            if pair_url and isinstance(pair_url, str) and ("t.me" in pair_url or "telegram" in pair_url.lower()):
-                                tg = pair_url if pair_url.startswith("http") else f"https://{pair_url}"
-
+                            # fallback: sometimes info has a direct "telegram" key
+                            tg = info.get("telegram") or info.get("tg")
                         if not tg:
                             continue
 
@@ -215,6 +226,28 @@ async def fetch_pair_data(session: aiohttp.ClientSession, addresses: set[str]) -
                     logger.warning("Pair chunk status %s for %s", resp.status, url[:80])
         except Exception as e:
             logger.error("Pair batch error for %s: %s", url[:80], e)
+
+    # If still no leads, try single‑token detail for the first 10 addresses
+    if not leads and addr_list:
+        logger.info("No leads from batch, trying single‑token details...")
+        for addr in addr_list[:10]:
+            chain_id, token_addr = addr.split(":", 1)
+            tg, tw, web = await get_single_token_socials(session, chain_id, token_addr)
+            if tg:
+                # We don't have liquidity here, so fetch it from batch? We'll set 0 for now.
+                # In a production bot you'd re‑fetch, but for diagnostic we just report.
+                leads.append({
+                    "name": "unknown",
+                    "chain": chain_id,
+                    "tg": tg,
+                    "tw": tw,
+                    "web": web,
+                    "addr": token_addr,
+                    "liquidity": 0,  # will likely be filtered out, but we need the TG
+                })
+        if leads:
+            logger.info("Single‑token details found %d Telegram links.", len(leads))
+
     return leads
 
 # ----------------------------------------------------------------------
