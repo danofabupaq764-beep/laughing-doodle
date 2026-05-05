@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """
 Dexscreener Telegram Lead Bot – DM Only
-Hosting-ready version for Railway with persistent SQLite storage.
+Diagnostic version – logs raw link data from first few tokens.
 """
 
 import asyncio
+import json
 import logging
 import os
 import sys
@@ -15,7 +16,7 @@ from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 
 # ----------------------------------------------------------------------
-# Configuration (all from environment)
+# Configuration
 # ----------------------------------------------------------------------
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 if not BOT_TOKEN:
@@ -146,7 +147,6 @@ async def fetch_liquidity_batch(session: aiohttp.ClientSession, addresses: list[
     return result
 
 def extract_token_info(token: dict) -> dict | None:
-    """Return a dict with name, chain, tg_link, tw, web, addr, full_addr, or None."""
     if not all(k in token for k in ("name", "chainId", "tokenAddress", "links")):
         return None
 
@@ -191,7 +191,6 @@ async def job_fetch_and_send(context: ContextTypes.DEFAULT_TYPE):
     logger.info("Fetch cycle started for %d user(s).", len(active_users))
 
     async with aiohttp.ClientSession() as session:
-        # 1. Fetch from two sources to increase chances
         profiles_latest = await fetch_profiles(
             session,
             "https://api.dexscreener.com/token-profiles/latest/v1",
@@ -206,15 +205,23 @@ async def job_fetch_and_send(context: ContextTypes.DEFAULT_TYPE):
         all_profiles = profiles_latest + profiles_boosted
         logger.info("Total profiles collected: %d", len(all_profiles))
 
+        # --- DIAGNOSTIC: log first 3 tokens' full links ---
+        for i, tok in enumerate(all_profiles[:3]):
+            logger.info(
+                "Sample token %d: name=%s links=%s",
+                i + 1,
+                tok.get("name", "?"),
+                json.dumps(tok.get("links", [])),
+            )
+        # ------------------------------------------------
+
         if not all_profiles:
-            # Send a "no data" message once per cycle
             for _, chat_id, _ in active_users:
                 await context.bot.send_message(
                     chat_id=chat_id, text="ℹ️ Dexscreener returned no profiles this cycle."
                 )
             return
 
-        # 2. Extract candidates with Telegram, deduplicate
         candidates = []
         seen_tg = set()
         for token in all_profiles:
@@ -234,12 +241,10 @@ async def job_fetch_and_send(context: ContextTypes.DEFAULT_TYPE):
                 )
             return
 
-        # 3. Fetch liquidity
         liq_map = await fetch_liquidity_batch(
             session, [c["full_addr"] for c in candidates]
         )
 
-        # 4. Filter by user min_liq and send
         sent_any = False
         for user_id, chat_id, min_liq in active_users:
             user_sent = 0
