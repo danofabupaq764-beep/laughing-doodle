@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 """
 Dexscreener Telegram Lead Bot – DM Only
-Stable, no age filter – extracts Telegram from live pairs.
+Finds tokens launched in the last 24 hours (via Token Profiles + Pair age filter).
 """
 
 import asyncio
 import logging
 import os
 import sys
+import time
 
 import aiohttp
 import aiosqlite
@@ -22,7 +23,7 @@ if not BOT_TOKEN:
 DB_PATH = os.getenv("DB_PATH", "leads.db")
 FETCH_INTERVAL = int(os.getenv("FETCH_INTERVAL", "45"))
 DEFAULT_MIN_LIQUIDITY = float(os.getenv("DEFAULT_MIN_LIQUIDITY", "50"))
-CHAINS = os.getenv("CHAINS", "bsc,ethereum,solana,avalanche,base,arbitrum,optimism,polygon").split(",")
+MAX_PAIR_AGE_HOURS = int(os.getenv("MAX_PAIR_AGE_HOURS", "24"))
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -106,10 +107,33 @@ async def set_min_liquidity(user_id: int, value: float):
         await db.commit()
 
 # ----------------------------------------------------------------------
-# Telegram extraction (proven logic)
+# Dexscreener API helpers
 # ----------------------------------------------------------------------
-def find_tg(socials: list, info: dict) -> str | None:
-    # 1. socials array
+async def fetch_addresses(session: aiohttp.ClientSession, url: str, label: str) -> set[tuple]:
+    """Return set of (chainId, tokenAddress) from a token-profiles endpoint."""
+    addresses = set()
+    try:
+        async with session.get(url) as resp:
+            if resp.status == 200:
+                data = await resp.json()
+                if isinstance(data, list):
+                    for token in data:
+                        chain = token.get("chainId")
+                        addr = token.get("tokenAddress")
+                        if chain and addr:
+                            addresses.add((chain, addr))
+                    logger.info("%s: %d addresses", label, len(addresses))
+                    return addresses
+                logger.warning("%s: unexpected format %s", label, type(data))
+            else:
+                logger.error("%s: status %s", label, resp.status)
+    except Exception as e:
+        logger.error("%s: request failed: %s", label, e)
+    return addresses
+
+def find_telegram(socials: list, info: dict) -> str | None:
+    """Extract Telegram link from socials array or info dict."""
+    # 1. socials
     for s in (socials or []):
         if not isinstance(s, dict):
             continue
@@ -120,50 +144,73 @@ def find_tg(socials: list, info: dict) -> str | None:
         if any(w in t for w in ("telegram", "tg")) or \
            any(d in url for d in ("t.me", "telegram.me", "telegram.org")):
             return url if url.startswith("http") else f"https://{url}"
-    # 2. info dict fallback
+    # 2. info dict
     for key in ("telegram", "tg"):
         val = (info or {}).get(key)
         if val and isinstance(val, str) and "t.me" in val:
             return val if val.startswith("http") else f"https://{val}"
     return None
 
-# ----------------------------------------------------------------------
-# Search chain (no age filter)
-# ----------------------------------------------------------------------
-async def search_chain(session: aiohttp.ClientSession, query: str) -> list[dict]:
-    url = f"https://api.dexscreener.com/latest/dex/search?q={query}"
-    try:
-        async with session.get(url) as resp:
-            if resp.status == 200:
-                data = await resp.json()
-                return data.get("pairs") or []
-            else:
-                logger.warning("Search '%s' returned %s", query, resp.status)
-    except Exception as e:
-        logger.error("Search '%s' error: %s", query, e)
-    return []
+async def fetch_pairs_batch(session: aiohttp.ClientSession, addr_set: set[tuple]) -> list[dict]:
+    """Batch-fetch pair data for given (chain, tokenAddress) tuple set.
+    Returns a list of lead dicts that pass the 24h age filter and have a Telegram link."""
+    leads = []
+    addr_list = [f"{chain}:{addr}" for chain, addr in addr_set]
+    base_url = "https://api.dexscreener.com/latest/dex/tokens/"
+    chunk_size = 30
 
-def process_pair(pair: dict) -> dict | None:
-    base = pair.get("baseToken") or {}
-    name = base.get("name") or base.get("symbol") or "?"
-    chain = pair.get("chainId", "?")
-    liq = pair.get("liquidity", {}).get("usd", 0)
-    info = pair.get("info") or {}
-    socials = info.get("socials", [])
-    tg = find_tg(socials, info)
-    if not tg:
-        return None
-    twitter = website = None
-    for s in socials:
-        st = s.get("type", "").lower()
-        su = s.get("url", "")
-        if not su:
-            continue
-        if "twitter" in st and not twitter:
-            twitter = su
-        if "website" in st and not website:
-            website = su
-    return {"name": name, "chain": chain, "tg": tg, "tw": twitter, "web": website, "liquidity": liq}
+    for i in range(0, len(addr_list), chunk_size):
+        chunk = addr_list[i:i + chunk_size]
+        url = base_url + ",".join(chunk)
+        try:
+            async with session.get(url) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    pairs = data.get("pairs") or []   # handle null
+                    for pair in pairs:
+                        # Age filter
+                        created_at = pair.get("pairCreatedAt")
+                        if not created_at:
+                            continue
+                        age_hours = (time.time() * 1000 - created_at) / (1000 * 3600)
+                        if age_hours > MAX_PAIR_AGE_HOURS:
+                            continue
+
+                        info = pair.get("info") or {}
+                        socials = info.get("socials", [])
+                        tg = find_telegram(socials, info)
+                        if not tg:
+                            continue
+
+                        base = pair.get("baseToken", {})
+                        name = base.get("name") or base.get("symbol") or "?"
+                        chain = pair.get("chainId", "?")
+                        liquidity = pair.get("liquidity", {}).get("usd", 0)
+
+                        twitter = website = None
+                        for s in socials:
+                            st = s.get("type", "").lower()
+                            su = s.get("url", "")
+                            if not su:
+                                continue
+                            if "twitter" in st and not twitter:
+                                twitter = su
+                            if "website" in st and not website:
+                                website = su
+
+                        leads.append({
+                            "name": name,
+                            "chain": chain,
+                            "tg": tg,
+                            "tw": twitter,
+                            "web": website,
+                            "liquidity": liquidity,
+                        })
+                else:
+                    logger.warning("Pairs batch %s status %s", url[:80], resp.status)
+        except Exception as e:
+            logger.error("Pairs batch error %s: %s", url[:80], e)
+    return leads
 
 # ----------------------------------------------------------------------
 # Main job
@@ -175,35 +222,27 @@ async def job_fetch_and_send(context: ContextTypes.DEFAULT_TYPE):
 
     logger.info("Fetch started")
 
-    async with aiohttp.ClientSession() as s:
-        all_pairs = []
-        for chain in CHAINS:
-            all_pairs.extend(await search_chain(s, chain.strip()))
-            all_pairs.extend(await search_chain(s, f"usdt {chain.strip()}"))
+    async with aiohttp.ClientSession() as session:
+        # 1. Gather ALL token addresses from profile endpoints
+        latest = await fetch_addresses(session, "https://api.dexscreener.com/token-profiles/latest/v1", "Latest")
+        boosted = await fetch_addresses(session, "https://api.dexscreener.com/token-boosts/latest/v1", "Boosted")
+        all_addrs = latest | boosted
+        logger.info("Total unique token addresses: %d", len(all_addrs))
 
-        # Deduplicate by pair address
-        unique = {}
-        for p in all_pairs:
-            addr = p.get("pairAddress")
-            if addr and addr not in unique:
-                unique[addr] = p
+        if not all_addrs:
+            return
 
-        logger.info("Unique pairs: %d", len(unique))
-
-        leads = []
-        for p in unique.values():
-            ld = process_pair(p)
-            if ld:
-                leads.append(ld)
-
-        logger.info("Telegram leads: %d", len(leads))
+        # 2. Fetch pair data for all addresses, keep only fresh ones with Telegram
+        leads = await fetch_pairs_batch(session, all_addrs)
+        logger.info("Fresh leads with Telegram (≤%dh): %d", MAX_PAIR_AGE_HOURS, len(leads))
         if leads:
             sample = leads[0]
             logger.info("Sample: %s | tg=%s | liq=$%.2f", sample["name"], sample["tg"], sample["liquidity"])
 
         if not leads:
-            return  # silent – no leads, no message
+            return  # silent
 
+        # 3. Send to active users (respecting min liquidity and dedup)
         sent_any = False
         for uid, cid, minliq in active_users:
             sent = 0
@@ -230,10 +269,10 @@ async def job_fetch_and_send(context: ContextTypes.DEFAULT_TYPE):
                         await set_active(uid, False)
             if sent:
                 sent_any = True
-                logger.info("Sent %d to user %s", sent, uid)
+                logger.info("Sent %d lead(s) to user %s", sent, uid)
 
         if not sent_any:
-            logger.info("All leads filtered (duplicates/liquidity).")
+            logger.info("All leads filtered out (duplicates/liquidity).")
 
 # ----------------------------------------------------------------------
 # Command handlers
@@ -270,7 +309,7 @@ async def cmd_minliq(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"💰 Min liquidity set to ${v:,.2f}")
 
 # ----------------------------------------------------------------------
-# Application entry
+# Application
 # ----------------------------------------------------------------------
 async def build_bot():
     await init_db()
